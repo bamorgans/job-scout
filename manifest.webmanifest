@@ -1,0 +1,16 @@
+{
+  "name": "Job Scout — Freelance Opportunity Radar",
+  "short_name": "Job Scout",
+  "description": "Local-first radar for freelance opportunities, meetups, and company intel.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#080D1A",
+  "theme_color": "#080D1A",
+  "icons": [
+    { "src": "./icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
