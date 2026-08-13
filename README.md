@@ -1,5 +1,7 @@
 # Scout — standalone install
 
+> Version 1.01
+
 Scout is a single-page web app. There's no build step and no framework install.
 This folder is everything needed to run it on the web and install it on an iPhone.
 

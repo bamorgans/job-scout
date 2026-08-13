@@ -1,5 +1,5 @@
 /* Scout service worker — offline shell + install support */
-const CACHE = "scout-v1";
+const CACHE = "scout-v1.01";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest"];
 
 self.addEventListener("install", e => {

@@ -154,6 +154,10 @@ a:hover{text-decoration:underline}
 .searchbar{position:relative}
 .searchbar .ic{position:absolute;left:13px;top:50%;transform:translateY(-50%);color:var(--ink-faint);pointer-events:none}
 .searchbar .input{padding-left:40px}
+.btn-clear{position:absolute;right:8px;top:50%;transform:translateY(-50%);
+  display:grid;place-items:center;width:28px;height:28px;border-radius:50%;
+  color:var(--ink-dim);background:var(--glass);border:1px solid var(--stroke)}
+.btn-clear:hover{background:var(--glass-hover);color:var(--ink)}
 .check{width:18px;height:18px;accent-color:var(--accent);cursor:pointer;flex:none}
 
 /* ---------- fit gauge (signature) ---------- */
@@ -294,6 +298,7 @@ a:hover{text-decoration:underline}
     <div class="searchbar grow">
       <i data-lucide="search" class="ic"></i>
       <input class="input" id="q" placeholder="Search any field — title, company, tech, city, notes..." autocomplete="off">
+      <button class="btn-clear hide" id="qClear" title="Clear search" aria-label="Clear search"><i data-lucide="x" class="ic-sm ic"></i></button>
     </div>
     <button class="btn btn-icon" id="saveSearchBtn" title="Save this search" aria-label="Save search">
       <i data-lucide="bookmark-plus" class="ic"></i></button>
@@ -370,6 +375,9 @@ const state={
     email:"bobmorganstern@gmail.com",savedSearches:[],apiKey:"",proxyUrl:"",freshHours:6,
     emailTpl:"Hi {contact},\n\nI came across {title} at {company} and it lines up closely with my background — 20+ years in cross-platform engineering (React Native TV/mobile/web) and AI-orchestrated development pipelines.\n\nPortfolio: https://bamorgans.github.io\nLinkedIn: https://www.linkedin.com/in/bobmorganstern/\n\nWould you be open to a short call this week?\n\nBest,\nBob Morganstern\n(408) 529-1416"},
   loading:{opps:false,meetups:false,company:false},
+  errors:{opps:null,meetups:null,company:null},
+  controllers:{opps:null,meetups:null,company:null},
+  lastCompany:"",
   map:null, editing:null
 };
 
@@ -433,45 +441,112 @@ $("#saveSearchBtn").onclick=async()=>{
   renderSavedSearches();
 };
 
-/* ---------- Claude research (live web engine, dual-mode) ----------
-   Priority: (1) user proxy URL, (2) BYO key direct-from-browser, (3) Claude.ai sandbox proxy. */
-function parseLoose(text){
-  const start=Math.min(...["[","{"].map(c=>{const i=text.indexOf(c);return i<0?Infinity:i}));
-  if(!isFinite(start)) throw new Error("no JSON in response");
-  let s=text.slice(start).replace(/```json|```/g,"").trim();
-  try{return JSON.parse(s)}catch(e){}
-  const cut=s.lastIndexOf("}");
-  if(cut>0){let r=s.slice(0,cut+1); if(r[0]==="[") r+="]"; try{return JSON.parse(r)}catch(e){}}
-  throw new Error("could not parse model output");
-}
-async function claude(prompt,useSearch=true){
-  const body={model:"claude-sonnet-4-6",max_tokens:1000,
-    messages:[{role:"user",content:prompt}]};
-  if(useSearch) body.tools=[{type:"web_search_20250305",name:"web_search"}];
+/* ============================================================
+   COMMON FETCH ENGINE — one path for every live request.
+   Robust JSON extraction, per-request timeout + cancellation,
+   guaranteed loading cleanup, graceful failure everywhere.
+   ============================================================ */
 
+/* Robust JSON extractor: tolerates prose, citations ([1]), code fences,
+   and truncation (recovers a partial array by closing it). */
+function extractJSON(text){
+  if(!text) throw new Error("Empty response from the model.");
+  let s=text.replace(/```json|```/g,"");
+  try{return JSON.parse(s.trim())}catch(e){}
+  const balanced=(open,close,requireBrace)=>{
+    const out=[]; let depth=0,start=-1,inStr=false,esc=false;
+    for(let i=0;i<s.length;i++){const c=s[i];
+      if(inStr){ if(esc)esc=false; else if(c==="\\")esc=true; else if(c==='"')inStr=false; continue; }
+      if(c==='"'){inStr=true;continue;}
+      if(c===open){ if(depth===0)start=i; depth++; }
+      else if(c===close && depth>0){ depth--; if(depth===0&&start>=0){ const sub=s.slice(start,i+1);
+        if(requireBrace && sub.indexOf("{")<0) continue;   // skip primitive arrays like [1] or citations
+        try{out.push(JSON.parse(sub))}catch(_){} } }
+    }
+    return out;
+  };
+  // 1) real list payloads: balanced arrays that contain objects (largest wins)
+  const arrs=balanced("[","]",true);
+  if(arrs.length) return arrs.sort((a,b)=>b.length-a.length)[0];
+  // 2) truncation repair: first [ … last complete } then close the array
+  const a=s.indexOf("["), lastObj=s.lastIndexOf("}");
+  if(a>=0 && lastObj>a){ const cand=s.slice(a,lastObj+1)+"]"; if(cand.indexOf("{")>=0){ try{return JSON.parse(cand)}catch(e){} } }
+  // 3) object payloads (company research): richest object wins
+  const objs=balanced("{","}",false);
+  if(objs.length) return objs.sort((a,b)=>Object.keys(b).length-Object.keys(a).length)[0];
+  throw new Error("Couldn't read the results (model returned no valid JSON).");
+}
+
+/* Friendly message for a connection that isn't wired up. */
+function connErr(){
+  if(!window.storage && !state.settings.apiKey && !state.settings.proxyUrl)
+    return "No live connection set. Add your API key or proxy URL in Setup.";
+  return "Network blocked (CORS or offline). Check your key / proxy URL in Setup.";
+}
+const humanErr=e=>e&&e.message?e.message:"Something went wrong.";
+
+/* Single low-level call. Uses the caller's AbortSignal; never manages UI. */
+async function callClaude(prompt,maxTokens,signal){
   const url=state.settings.proxyUrl?.trim() || "https://api.anthropic.com/v1/messages";
   const headers={"Content-Type":"application/json"};
   const key=state.settings.apiKey?.trim();
-  // Only attach key/browser-access header when calling Anthropic directly (not a proxy that adds its own auth)
   if(key && !state.settings.proxyUrl){
     headers["x-api-key"]=key;
     headers["anthropic-version"]="2023-06-01";
     headers["anthropic-dangerous-direct-browser-access"]="true";
   }
-
+  const body={model:"claude-sonnet-4-6",max_tokens:maxTokens,
+    messages:[{role:"user",content:prompt}],
+    tools:[{type:"web_search_20250305",name:"web_search",max_uses:6}]};
   let res;
   try{
-    res=await fetch(url,{method:"POST",headers,body:JSON.stringify(body)});
+    res=await fetch(url,{method:"POST",headers,body:JSON.stringify(body),signal});
   }catch(e){
-    // TypeError here = blocked before any HTTP response: CORS / network / offline
-    if(!window.storage && !key && !state.settings.proxyUrl)
-      throw new Error("Blocked by CORS. Add your Anthropic API key or a proxy URL in Setup to run this outside Claude.ai.");
-    throw new Error("Network blocked (CORS/offline). Check your key or proxy URL in Setup.");
+    if(e.name==="AbortError") throw e;      // handled upstream
+    throw new Error(connErr());             // TypeError = CORS/offline
+  }
+  if(!res.ok){
+    let m="Request failed ("+res.status+")";
+    try{const j=await res.json(); m=j&&j.error&&j.error.message?j.error.message:m;}catch(_){}
+    throw new Error(m);
   }
   const data=await res.json();
-  if(data.error) throw new Error(data.error.message||("API error "+res.status));
+  if(data.error) throw new Error(data.error.message||"API error");
   const text=(data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n");
-  return parseLoose(text);
+  return extractJSON(text);
+}
+
+/* Guarded call: owns the AbortController + timeout, aborts any prior request
+   of the same kind, and always cleans up. Returns parsed JSON or throws. */
+async function guardedCall(key,prompt,maxTokens,timeoutMs){
+  try{ state.controllers[key]&&state.controllers[key].abort("restart"); }catch(_){}
+  const ctrl=new AbortController(); state.controllers[key]=ctrl;
+  const timer=setTimeout(()=>{ctrl._timeout=true; try{ctrl.abort("timeout")}catch(_){}}, timeoutMs);
+  try{
+    return await callClaude(prompt,maxTokens,ctrl.signal);
+  }catch(err){
+    if(err.name==="AbortError"){
+      if(ctrl._timeout) throw new Error("Timed out — the search took too long. Try again.");
+      const e=new Error("cancelled"); e.cancelled=true; throw e;   // superseded by a newer request
+    }
+    throw err;
+  }finally{
+    clearTimeout(timer);
+    if(state.controllers[key]===ctrl) state.controllers[key]=null;
+  }
+}
+
+/* Wrap a scan tab's work with loading + error UI. Never leaves loading stuck. */
+async function runScan(key,work){
+  state.loading[key]=true; state.errors[key]=null; render();
+  try{
+    await work();
+  }catch(err){
+    if(err.cancelled){ return; }            // a newer scan took over; stay quiet
+    state.errors[key]=humanErr(err); toast(state.errors[key]);
+  }finally{
+    state.loading[key]=false; render();
+  }
 }
 
 /* ---------- freshness ---------- */
@@ -481,54 +556,63 @@ function ago(ts){if(!ts)return"never";const m=Math.round((Date.now()-ts)/60000);
   if(m<1)return"just now";if(m<60)return m+"m ago";const h=Math.round(m/60);
   if(h<24)return h+"h ago";return Math.round(h/24)+"d ago";}
 
-async function scanJobs(){
-  state.loading.opps=true; render();
-  try{
-    const items=await claude(
-`Search the live web now (free job boards: Wellfound, RemoteOK, WeWorkRemotely, Hacker News Who's Hiring, Braintrust, LinkedIn public listings, Reddit r/forhire, r/reactnative) for CURRENT senior contract/freelance/founding-engineer opportunities matching this profile:
+/* ---------- scans (all share the engine above) ---------- */
+function scanJobs(){ return runScan("opps", async()=>{
+  const items=await guardedCall("opps",
+`Search the live web NOW for CURRENT senior contract / freelance / founding-engineer / fractional opportunities matching this profile:
 ${state.settings.profile}
 Location preference: ${state.settings.location} (remote OK).
-Respond ONLY with a compact single-line JSON array (max 5 items), no prose, no markdown fences, keep every string short. Each item:
-{"title":"","company":"","type":"contract|freelance|full-time|fractional","rate":"","location":"","remote":true,"source":"","url":"","skills":["",""],"fitScore":0-100,"fitReason":"max 12 words","summary":"max 15 words"}
-fitScore = honest match against the profile. Prefer real, current postings with working URLs.`);
-    const now=Date.now();
-    items.forEach(j=>{ if(!state.data.jobs.some(x=>x.title===j.title&&x.company===j.company))
-      state.data.jobs.push(Object.assign({id:uid(),status:"new",notes:"",added:now},j)); });
-    state.data.meta.jobsScan=Date.now();
-    await save(); toast(`Found ${items.length} opportunities`);
-  }catch(e){toast("Scan failed: "+e.message)}
-  state.loading.opps=false; render();
-}
+Search across free job boards: Wellfound, RemoteOK, WeWorkRemotely, Hacker News "Who's Hiring", Braintrust, public LinkedIn listings, Reddit r/forhire and r/reactnative.
+Return 6–8 real, current postings with working URLs. For each, include the posting date and, if discoverable, the hiring manager / recruiter name and their LinkedIn URL (leave "" if unknown — never invent).
+Respond with ONLY a JSON array, no prose, no code fences. Each item exactly:
+{"title":"","company":"","type":"contract|freelance|full-time|fractional","rate":"","location":"","remote":true,"posted":"YYYY-MM-DD or relative like '3 days ago' or 'unknown'","source":"","url":"","hiringManager":"","hiringManagerLinkedin":"","skills":["","",""],"fitScore":0,"fitReason":"max 14 words","summary":"max 18 words"}
+fitScore is an honest 0–100 match against the profile.`,
+    6000, 90000);
+  const arr=Array.isArray(items)?items:(items.jobs||items.results||[]);
+  const now=Date.now();
+  arr.forEach(j=>{ if(j&&j.title&&!state.data.jobs.some(x=>x.title===j.title&&x.company===j.company))
+    state.data.jobs.push(Object.assign({id:uid(),status:"new",notes:"",added:now},j)); });
+  state.data.meta.jobsScan=Date.now();
+  await save(); toast(arr.length?`Found ${arr.length} opportunities`:"No new opportunities found");
+});}
 
-async function scanMeetups(){
-  state.loading.meetups=true; render();
-  try{
-    const items=await claude(
-`Search the live web now (Meetup.com, Luma/lu.ma, Eventbrite, community calendars) for UPCOMING in-person tech networking events near ${state.settings.location} relevant to: React/React Native, AI engineering, agentic AI, startups, freelancing/indie consulting, video/streaming tech.
-Respond ONLY with a compact single-line JSON array (max 5), no prose, no fences, keep strings short. Each item:
-{"name":"","org":"","date":"YYYY-MM-DD","time":"","venue":"","address":"","lat":0.0,"lng":0.0,"url":"","topics":["",""],"whyGo":"max 12 words on networking value for a senior AI/React consultant"}
-lat/lng must be real coordinates of the venue or city area.`);
-    items.forEach(m=>{ if(!state.data.meetups.some(x=>x.name===m.name&&x.date===m.date))
-      state.data.meetups.push(Object.assign({id:uid()},m)); });
-    state.data.meta.meetupsScan=Date.now();
-    await save(); toast(`Found ${items.length} meetups`);
-  }catch(e){toast("Scan failed: "+e.message)}
-  state.loading.meetups=false; render();
-}
+function scanMeetups(){ return runScan("meetups", async()=>{
+  const items=await guardedCall("meetups",
+`Search the live web NOW (Meetup.com, Luma / lu.ma, Eventbrite, community calendars) for UPCOMING in-person tech networking events near ${state.settings.location} relevant to: React / React Native, AI engineering, agentic AI, startups, freelancing / indie consulting, video / streaming tech.
+Return 6–8 real upcoming events with working URLs and accurate venue coordinates.
+Respond with ONLY a JSON array, no prose, no code fences. Each item exactly:
+{"name":"","org":"","date":"YYYY-MM-DD","time":"","venue":"","address":"","lat":0.0,"lng":0.0,"url":"","topics":["",""],"whyGo":"max 14 words on networking value for a senior AI/React consultant"}
+lat/lng must be real coordinates of the venue or the city area.`,
+    5000, 90000);
+  const arr=Array.isArray(items)?items:(items.meetups||items.events||[]);
+  arr.forEach(m=>{ if(m&&m.name&&!state.data.meetups.some(x=>x.name===m.name&&x.date===m.date))
+    state.data.meetups.push(Object.assign({id:uid()},m)); });
+  state.data.meta.meetupsScan=Date.now();
+  await save(); toast(arr.length?`Found ${arr.length} meetups`:"No new meetups found");
+});}
 
 async function researchCompany(name,jobId){
-  state.loading.company=true; openDrawer(companyLoadingHTML(name));
+  name=(name||"").trim(); if(!name)return;
+  state.lastCompany=name;
+  state.loading.company=true; state.errors.company=null;
+  openDrawer(companyLoadingHTML(name));
   try{
-    const c=await claude(
-`Deep-research the company "${name}" using live web search (official site, Glassdoor reviews, LinkedIn, Crunchbase, news, Reddit).
-Respond ONLY with compact JSON, no prose, no fences:
-{"name":"","what":"2 sentences","location":"","size":"","founded":"","ceo":"","ceoBackground":"1 sentence","staff":"team/culture personality in 1-2 sentences","glassdoorRating":"e.g. 4.1/5 or unknown","pros":["","",""],"cons":["","",""],"techStack":["",""],"competitors":["",""],"news":["1 recent headline",""],"links":[{"label":"","url":""}],"fitAngle":"1 sentence: best angle for a senior React Native + AI consultant to pitch them"}`);
+    const c=await guardedCall("company",
+`Research the company "${name}" using live web search (official site, Glassdoor, LinkedIn, Crunchbase, recent news, Reddit).
+Respond with ONLY a JSON object, no prose, no code fences:
+{"name":"","what":"2 sentences on what they do","location":"","size":"","founded":"","ceo":"","ceoBackground":"1 sentence","staff":"team/culture personality in 1-2 sentences","glassdoorRating":"e.g. 4.1/5 or unknown","pros":["","",""],"cons":["","",""],"techStack":["",""],"competitors":["",""],"news":["recent headline",""],"links":[{"label":"","url":""}],"fitAngle":"1 sentence: best angle for a senior React Native + AI consultant to pitch them"}`,
+      2800, 75000);
+    if(!c.name)c.name=name;
     c.id=uid(); c.researched=Date.now(); if(jobId)c.jobId=jobId;
-    state.data.companies=state.data.companies.filter(x=>x.name.toLowerCase()!==c.name.toLowerCase());
+    state.data.companies=state.data.companies.filter(x=>(x.name||"").toLowerCase()!==c.name.toLowerCase());
     state.data.companies.push(c); await save();
     openDrawer(companyHTML(c));
-  }catch(e){toast("Research failed: "+e.message); closeDrawer();}
-  state.loading.company=false; if(state.tab==="companies")render();
+  }catch(err){
+    if(err.cancelled){ return; }
+    openDrawer(companyErrorHTML(name, humanErr(err)));
+  }finally{
+    state.loading.company=false; if(state.tab==="companies")render();
+  }
 }
 
 /* ---------- search & sort ---------- */
@@ -627,7 +711,7 @@ function jobCard(j){
     <div class="gauge gauge-sm ${gaugeCls(j.fitScore)}" style="--v:${j.fitScore||0}"><span>${j.fitScore??"–"}</span></div>
     <div class="grow">
       <div style="font-weight:600" class="ellip">${esc(j.title)}</div>
-      <div class="small muted ellip">${esc(j.company)} · ${esc(j.location||"")}</div>
+      <div class="small muted ellip">${esc(j.company)} · ${esc(j.location||"")}${j.posted?` · <span class="faint">${esc(j.posted)}</span>`:""}</div>
     </div>
     <div class="small ellip">${(j.skills||[]).slice(0,3).map(s=>`<span class="chip">${esc(s)}</span>`).join(" ")}</div>
     <div class="mono small">${esc(j.rate||"—")}</div>
@@ -652,6 +736,7 @@ function viewOpps(){
   const head=`<div class="section-head"><div><div class="h2">Best-fit opportunities</div>
     <div class="small faint mono">Updated ${ago(state.data.meta?.jobsScan)}${isFresh("jobsScan")?" · fresh":" · stale"}</div></div>
     <div class="row">
+      <button class="btn btn-sm" id="addJobHead" title="Add manually"><i data-lucide="circle-plus" class="ic-sm ic"></i>Add</button>
       <button class="btn btn-sm" id="scanJobs">${state.loading.opps?'<i data-lucide="loader-circle" class="ic-sm ic spin"></i>Scanning':'<i data-lucide="satellite-dish" class="ic-sm ic"></i>Scan live'}</button>
       <button class="btn btn-sm btn-ghost" id="selAll">Select all</button>
     </div></div>`;
@@ -660,11 +745,20 @@ function viewOpps(){
     ${sortTh("opps","company","Skills")}${sortTh("opps","rate","Rate")}${sortTh("opps","status","Status")}<span></span></div>`;
   let body;
   if(state.loading.opps&&!rows.length) body=`<div class="list"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>`;
-  else if(!rows.length) body=`<div class="glass empty"><i data-lucide="radar" class="ic"></i>
+  else if(state.errors.opps&&!rows.length) body=`<div class="glass empty"><i data-lucide="circle-minus" class="ic"></i>
+    <div class="h2">Scan failed</div><div class="muted small" style="max-width:380px">${esc(state.errors.opps)}</div>
+    <button class="btn btn-primary" id="scanJobs2"><i data-lucide="satellite-dish" class="ic"></i>Try again</button></div>`;
+  else if(!rows.length&&state.q) body=`<div class="glass empty"><i data-lucide="search" class="ic"></i>
+    <div class="h2">No matches for “${esc(state.q)}”</div>
+    <button class="btn" id="clearSearchInline">Clear search</button></div>`;
+  else if(!rows.length) body=`<div class="glass empty"><i data-lucide="briefcase-business" class="ic"></i>
     <div class="h2">No opportunities yet</div>
-    <div class="muted small" style="max-width:380px">Run a live scan to research job boards, Reddit, and news for senior contract work matched to your profile — or load a sample set to explore the app offline.</div>
-    <div class="row"><button class="btn btn-primary" id="scanJobs2"><i data-lucide="satellite-dish" class="ic"></i>Scan live</button>
-    <button class="btn" id="loadSample">Load sample data</button></div></div>`;
+    <div class="muted small" style="max-width:400px">Add opportunities yourself to track them here — status, notes, and outreach all work offline with nothing configured. Or run a live scan to auto-research job boards, Reddit, and news matched to your profile.</div>
+    <div class="row wrap" style="justify-content:center">
+      <button class="btn btn-primary" id="addJob"><i data-lucide="circle-plus" class="ic"></i>Add opportunity</button>
+      <button class="btn" id="scanJobs2"><i data-lucide="satellite-dish" class="ic"></i>Scan live</button>
+    </div>
+    <div class="small faint" style="max-width:400px">Live scan needs an API key or proxy URL in Setup. Adding and tracking do not.</div></div>`;
   else body=`<div class="list">${rows.map(jobCard).join("")}</div>`;
   return stats+head+thead+body;
 }
@@ -698,9 +792,11 @@ function viewMeetups(){
 }
 function viewCompanies(){
   const rows=sorted(state.data.companies.filter(matches),"companies");
+  const prefill=state.lastCompany&&!state.data.companies.some(c=>(c.name||"").toLowerCase()===state.lastCompany.toLowerCase())?state.lastCompany:"";
   const head=`<div class="section-head"><div class="h2">Company intel</div>
-    <div class="row"><input class="input btn-sm" id="intelName" placeholder="Research a company…" style="width:190px">
-    <button class="btn btn-sm btn-primary" id="intelGo"><i data-lucide="scan-search" class="ic-sm ic"></i>Research</button></div></div>`;
+    <div class="row"><input class="input btn-sm" id="intelName" placeholder="Research a company…" style="width:190px" value="${esc(prefill)}">
+    <button class="btn btn-sm btn-primary" id="intelGo"><i data-lucide="scan-search" class="ic-sm ic"></i>Research</button></div></div>
+    ${prefill?`<div class="small faint" style="margin:-8px 0 12px">Prefilled from your selected job — tap Research to run it.</div>`:""}`;
   const list=rows.length?`<div class="list">${rows.map(c=>`
     <div class="glass card click spread" data-comp="${c.id}">
       <div class="row grow"><i data-lucide="building-2" class="ic muted"></i>
@@ -774,6 +870,8 @@ function jobHTML(j){
     <dt>Type</dt><dd>${esc(j.type||"—")}</dd>
     <dt>Rate</dt><dd class="mono">${esc(j.rate||"—")}</dd>
     <dt>Location</dt><dd>${esc(j.location||"—")}${j.remote?" · remote OK":""}</dd>
+    <dt>Posted</dt><dd>${esc(j.posted||"—")}</dd>
+    <dt>Hiring manager</dt><dd>${j.hiringManager?esc(j.hiringManager):"—"}${j.hiringManagerLinkedin?` · <a href="${esc(j.hiringManagerLinkedin)}" target="_blank" rel="noopener">LinkedIn ↗</a>`:""}</dd>
     <dt>Source</dt><dd>${esc(j.source||"—")}</dd>
     <dt>Summary</dt><dd>${esc(j.summary||"—")}</dd>
     <dt>Skills</dt><dd class="row wrap">${(j.skills||[]).map(s=>`<span class="chip">${esc(s)}</span>`).join("")}</dd>
@@ -798,6 +896,12 @@ const companyLoadingHTML=n=>`<div class="spread"><div class="h2">${esc(n)}</div>
   <button class="btn btn-icon btn-ghost" data-close><i data-lucide="x" class="ic"></i></button></div>
   <div class="row muted" style="margin-top:16px"><i data-lucide="loader-circle" class="ic spin"></i>Researching the live web — company, reviews, leadership, competitors…</div>
   <div class="list" style="margin-top:16px"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>`;
+const companyErrorHTML=(n,msg)=>`<div class="spread"><div class="h2">${esc(n)}</div>
+  <button class="btn btn-icon btn-ghost" data-close><i data-lucide="x" class="ic"></i></button></div>
+  <div class="glass empty" style="margin-top:16px"><i data-lucide="circle-minus" class="ic"></i>
+    <div class="h2">Couldn't finish research</div>
+    <div class="muted small" style="max-width:360px">${esc(msg)}</div>
+    <button class="btn btn-primary" data-retry-company="${esc(n)}"><i data-lucide="scan-search" class="ic"></i>Try again</button></div>`;
 function companyHTML(c){
   return `<div class="spread"><div class="h2">${esc(c.name)}</div>
     <button class="btn btn-icon btn-ghost" data-close><i data-lucide="x" class="ic"></i></button></div>
@@ -845,6 +949,7 @@ function bindDrawer(){
     await save(); toast("Deleted"); closeDrawer(); render();});
   d.querySelector("[data-mail2]")?.addEventListener("click",()=>emailJob(j));
   d.querySelector("[data-intel2]")?.addEventListener("click",()=>researchCompany(j.company,j.id));
+  d.querySelector("[data-retry-company]")?.addEventListener("click",e=>researchCompany(e.currentTarget.dataset.retryCompany));
 }
 
 /* ---------- map (self-contained SVG projection) ---------- */
@@ -887,18 +992,47 @@ function initMap(){
   }));
 }
 
-/* ---------- sample data (offline demo) ---------- */
-function loadSample(){
-  const now=Date.now();
-  state.data.jobs.push(
-    {id:uid(),status:"new",notes:"",added:now,title:"Founding Engineer — Agentic AI Platform",company:"Northbeam Labs",type:"full-time",rate:"$190–230k + equity",location:"San Francisco, CA",remote:true,source:"Wellfound",url:"https://wellfound.com",skills:["React","TypeScript","LLM agents","MCP"],fitScore:92,fitReason:"Direct overlap with Forge and AI-orchestrated pipeline work.",summary:"Build multi-agent orchestration UI and infra for enterprise workflows."},
-    {id:uid(),status:"saved",notes:"",added:now,title:"React Native TV Contract — Streaming App",company:"Riverbend Media",type:"contract",rate:"$140/hr",location:"Remote (US)",remote:true,source:"Braintrust",url:"https://www.usebraintrust.com",skills:["React Native","Apple TV","Fire TV","Video"],fitScore:88,fitReason:"Mirrors the MotorTrend 4-platform TV migration exactly.",summary:"Port streaming app to Apple TV and Fire TV with shared codebase."},
-    {id:uid(),status:"new",notes:"",added:now,title:"Fractional Frontend Architect",company:"Claro Health",type:"fractional",rate:"$8k/mo retainer",location:"San Jose, CA",remote:false,source:"r/forhire",url:"https://reddit.com/r/forhire",skills:["Architecture","React","Mentoring"],fitScore:74,fitReason:"Seniority fit strong; healthcare domain is new.",summary:"Guide a 6-person team through a legacy-to-React migration."});
-  state.data.meetups.push(
-    {id:uid(),name:"AI Engineers SF — Agents in Production",org:"AI Eng Collective",date:"2026-08-20",time:"6:00 PM",venue:"SHACK15",address:"Ferry Building, San Francisco",lat:37.7955,lng:-122.3937,url:"https://lu.ma",topics:["Agents","MCP","Eval"],whyGo:"Founders hiring agent engineers attend; ideal Forge audience."},
-    {id:uid(),name:"South Bay React & React Native",org:"Meetup.com",date:"2026-08-14",time:"6:30 PM",venue:"Plug and Play",address:"440 N Wolfe Rd, Sunnyvale",lat:37.3852,lng:-122.0141,url:"https://meetup.com",topics:["React Native","TV apps"],whyGo:"Local RN community; strong referral network for contract work."},
-    {id:uid(),name:"Indie Consultants Roundtable",org:"Luma",date:"2026-08-27",time:"5:30 PM",venue:"San Pedro Square",address:"87 N San Pedro St, San Jose",lat:37.3366,lng:-121.8944,url:"https://lu.ma",topics:["Freelancing","Pricing","Referrals"],whyGo:"Complementary freelancers — the highest-value referral channel."});
-  save(); render(); toast("Sample data loaded");
+/* ---------- manual add opportunity (works fully offline) ---------- */
+function addJobHTML(){
+  return `<div class="spread"><div class="h2">Add opportunity</div>
+    <button class="btn btn-icon btn-ghost" data-close><i data-lucide="x" class="ic"></i></button></div>
+  <div class="stack" style="margin-top:8px">
+    <div class="field"><span class="label">Role title</span><input class="input" id="addTitle" placeholder="e.g. Senior React Native Engineer"></div>
+    <div class="field"><span class="label">Company</span><input class="input" id="addCompany" placeholder="Company name"></div>
+    <div class="row" style="gap:10px">
+      <div class="field grow"><span class="label">Type</span>
+        <select class="select" id="addType">${["contract","freelance","full-time","fractional"].map(t=>`<option>${t}</option>`).join("")}</select></div>
+      <div class="field grow"><span class="label">Rate</span><input class="input" id="addRate" placeholder="$150/hr"></div>
+    </div>
+    <div class="row" style="gap:10px">
+      <div class="field grow"><span class="label">Location</span><input class="input" id="addLoc" placeholder="Remote / San Jose"></div>
+      <div class="field grow"><span class="label">Posted</span><input class="input" id="addPosted" placeholder="today / 2026-08-12"></div>
+    </div>
+    <div class="field"><span class="label">Listing URL</span><input class="input" id="addUrl" placeholder="https://…"></div>
+    <div class="field"><span class="label">Hiring manager</span><input class="input" id="addHM" placeholder="Name (optional)"></div>
+    <div class="field"><span class="label">Hiring manager LinkedIn</span><input class="input" id="addHMln" placeholder="https://linkedin.com/in/… (optional)"></div>
+    <div class="field"><span class="label">Skills (comma-separated)</span><input class="input" id="addSkills" placeholder="React Native, TypeScript, Video"></div>
+    <div class="field"><span class="label">Fit score (0–100)</span><input class="input" id="addFit" type="number" min="0" max="100" placeholder="75"></div>
+    <div class="field"><span class="label">Notes</span><textarea class="textarea" id="addNotes" placeholder="Why it fits, contacts, next steps…"></textarea></div>
+    <div class="row"><button class="btn btn-primary" id="addSave"><i data-lucide="check" class="ic"></i>Add to tracker</button></div>
+  </div>`;
+}
+function openAddJob(){
+  openDrawer(addJobHTML());
+  $("#addSave").onclick=async()=>{
+    const title=$("#addTitle").value.trim(), company=$("#addCompany").value.trim();
+    if(!title&&!company){toast("Add at least a title or company");return}
+    const fit=parseInt($("#addFit").value,10);
+    state.data.jobs.unshift({id:uid(),status:"new",added:Date.now(),
+      title:title||"(untitled)", company:company||"", type:$("#addType").value,
+      rate:$("#addRate").value.trim(), location:$("#addLoc").value.trim(),
+      posted:$("#addPosted").value.trim(), url:$("#addUrl").value.trim(),
+      hiringManager:$("#addHM").value.trim(), hiringManagerLinkedin:$("#addHMln").value.trim(),
+      skills:$("#addSkills").value.split(",").map(s=>s.trim()).filter(Boolean),
+      fitScore:isFinite(fit)?Math.max(0,Math.min(100,fit)):0,
+      fitReason:"Added manually", summary:"", source:"manual", notes:$("#addNotes").value.trim()});
+    await save(); closeDrawer(); toast("Added to tracker"); render();
+  };
 }
 
 /* ---------- root render ---------- */
@@ -913,7 +1047,9 @@ function render(){
   /* wire view events */
   $("#scanJobs")&&($("#scanJobs").onclick=scanJobs);
   $("#scanJobs2")&&($("#scanJobs2").onclick=scanJobs);
-  $("#loadSample")&&($("#loadSample").onclick=loadSample);
+  $("#addJob")&&($("#addJob").onclick=openAddJob);
+  $("#addJobHead")&&($("#addJobHead").onclick=openAddJob);
+  $("#clearSearchInline")&&($("#clearSearchInline").onclick=()=>{state.q="";$("#q").value="";syncSearchUI();render();});
   $("#scanMeetups")&&($("#scanMeetups").onclick=scanMeetups);
   $("#scanMeetups2")&&($("#scanMeetups2").onclick=scanMeetups);
   $("#selAll")&&($("#selAll").onclick=()=>{
@@ -930,17 +1066,25 @@ function render(){
   $("#exportAll")&&($("#exportAll").onclick=exportAll);
   $("#importBtn")&&($("#importBtn").onclick=()=>$("#importFile").click());
   $("#wipe")&&($("#wipe").onclick=async()=>{
-    if(!confirm("Clear all cached jobs, meetups, and company intel?"))return;
-    state.data={jobs:[],meetups:[],companies:[],meta:{jobsScan:0,meetupsScan:0}}; state.selected.clear();
-    await save(); render(); toast("Cleared");});
+    if(!confirm("Clear all cached jobs, meetups, and company intel? This resets your tracked, strong-fit and in-play counts."))return;
+    Object.values(state.controllers).forEach(c=>{try{c&&c.abort("wipe")}catch(_){}});
+    state.controllers={opps:null,meetups:null,company:null};
+    state.loading={opps:false,meetups:false,company:false};
+    state.errors={opps:null,meetups:null,company:null};
+    state.data={jobs:[],meetups:[],companies:[],meta:{jobsScan:0,meetupsScan:0}};
+    state.selected.clear(); state.lastCompany=""; state.q=""; $("#q").value="";
+    await save(); render(); toast("All data cleared");});
 
   v.querySelectorAll("[data-sort]").forEach(el=>el.onclick=()=>{const[k,f]=el.dataset.sort.split(":");setSort(k,f)});
   v.querySelectorAll("[data-sel]").forEach(el=>el.onclick=e=>{e.stopPropagation();
-    const id=el.dataset.sel; state.selected.has(id)?state.selected.delete(id):state.selected.add(id); render();});
+    const id=el.dataset.sel; 
+    if(state.selected.has(id)){state.selected.delete(id);} else {state.selected.add(id);
+      const j=state.data.jobs.find(x=>x.id===id); if(j)state.lastCompany=j.company||"";}
+    render();});
   v.querySelectorAll("[data-open]").forEach(el=>el.onclick=e=>{
     if(e.target.closest("[data-sel],[data-mail],[data-intel]"))return;
     const j=state.data.jobs.find(x=>x.id===el.dataset.open); if(!j)return;
-    state.editing=j; openDrawer(jobHTML(j));});
+    state.lastCompany=j.company||""; state.editing=j; openDrawer(jobHTML(j));});
   v.querySelectorAll("[data-mail]").forEach(el=>el.onclick=e=>{e.stopPropagation();
     const j=state.data.jobs.find(x=>x.id===el.dataset.mail); if(j)emailJob(j);});
   v.querySelectorAll("[data-intel]").forEach(el=>el.onclick=e=>{e.stopPropagation();
@@ -957,14 +1101,16 @@ function render(){
 /* ---------- global wiring ---------- */
 $$(".tab").forEach(t=>t.onclick=()=>{state.tab=t.dataset.tab;state.selected.clear();render();
   if(state.tab==="meetups"&&!state.data.meetups.length&&!isFresh("meetupsScan")&&!state.loading.meetups) scanMeetups();});
-$("#q").addEventListener("input",e=>{state.q=e.target.value;render();});
+function syncSearchUI(){$("#qClear")&&$("#qClear").classList.toggle("hide",!state.q);}
+$("#q").addEventListener("input",e=>{state.q=e.target.value;syncSearchUI();render();});
+$("#qClear").onclick=()=>{state.q="";$("#q").value="";syncSearchUI();$("#q").focus();render();};
 $("#refreshBtn").onclick=()=>state.tab==="meetups"?scanMeetups():scanJobs();
 $("#hdrExport").onclick=exportAll;
 $("#hdrImport").onclick=()=>$("#importFile").click();
 
 /* ---------- boot: local-first, look at cache first, refetch only if stale ---------- */
 (async()=>{
-  await load(); applyTheme(); render(); renderSavedSearches();
+  await load(); applyTheme(); render(); renderSavedSearches(); syncSearchUI();
   const canCallApi = window.storage || state.settings.apiKey || state.settings.proxyUrl;
   if(canCallApi && !state.data.jobs.length && !isFresh("jobsScan")) scanJobs();
 })();
